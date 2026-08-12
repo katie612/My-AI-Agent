@@ -90,6 +90,7 @@ const paths = {
   ),
   documentDataDir: join(projectRoot, "data", "documents"),
   workflowsDir: join(projectRoot, "n8n", "workflows"),
+  workflowImportDir: join(runtimeRoot, "workflow-import"),
   backupsDir: join(projectRoot, "backups"),
   runtimeDir: runtimeRoot,
   npmCacheDir: join(runtimeRoot, "npm-cache"),
@@ -1135,6 +1136,40 @@ async function compileSkillBundle() {
   return JSON.stringify(await compileSkills());
 }
 
+// The committed workflow files address the chat gateway on its documented
+// default port. A learner who set CHAT_PORT in .env would otherwise import
+// tool workflows that call a port nothing is listening on, so the files are
+// staged with the configured port instead of being edited in place.
+const DEFAULT_GATEWAY_ORIGIN = "http://127.0.0.1:3000";
+
+function stageWorkflowsForImport(cfg) {
+  if (cfg.chatPort === 3000) {
+    return paths.workflowsDir;
+  }
+  const target = paths.workflowImportDir;
+  rmSync(target, { recursive: true, force: true });
+  mkdirSync(target, { recursive: true });
+  const origin = `http://127.0.0.1:${cfg.chatPort}`;
+  let rewritten = 0;
+  for (const name of readdirSync(paths.workflowsDir)) {
+    if (!name.endsWith(".json")) {
+      continue;
+    }
+    const source = readFileSync(join(paths.workflowsDir, name), "utf8");
+    const updated = source.split(DEFAULT_GATEWAY_ORIGIN).join(origin);
+    if (updated !== source) {
+      rewritten += 1;
+    }
+    writeFileSync(join(target, name), updated);
+  }
+  if (rewritten > 0) {
+    print(
+      `\nCHAT_PORT is ${cfg.chatPort}, so ${rewritten} workflow file(s) were imported with the chat gateway at ${origin}. The committed files are unchanged.`,
+    );
+  }
+  return target;
+}
+
 async function importReviewedWorkflows() {
   validateWorkflowFiles();
 
@@ -1145,8 +1180,9 @@ async function importReviewedWorkflows() {
   }
 
   print("\nImporting the reviewed workflows as inactive drafts...");
+  const importDir = stageWorkflowsForImport(config());
   n8nCliOrThrow(
-    ["import:workflow", "--separate", `--input=${paths.workflowsDir}`],
+    ["import:workflow", "--separate", `--input=${importDir}`],
     "Workflow import",
   );
 
