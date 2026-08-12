@@ -37,8 +37,9 @@ Do not split one request into repeated starts. Never retry a paid call automatic
 3. If the paid tool is unavailable, fails, or returns no useful paid SEO evidence, call `start_domain_research` once as the free fallback. Say simply that the paid data was unavailable and the result uses the public website instead. Never retry the paid call automatically.
 4. A partial paid result with useful rankings, keyword, competitor, or search-result evidence is still useful. Present what succeeded and mention what is missing in one short sentence; do not replace useful paid evidence with the free result.
 5. Never infer a successful component from another component or invent missing findings. Failed attempts must not replace the last successful saved memory.
-6. Keep job IDs, provider task IDs, location codes, language codes, raw component statuses, and internal field names out of the answer unless the user asks for technical details or troubleshooting.
-7. Use `complete_paid_domain_research` only with an exact non-cached job ID started in this conversation. Use `get_paid_domain_research` for a cache hit or later recall. Neither read tool makes a paid call.
+6. Distinguish three different outcomes in plain words, and never describe one as another. If paid search is not set up on this computer, say that it is not set up yet and no search was run; do not say the provider returned nothing. If the provider was asked and answered with nothing, say there was no search data for that domain. If the provider was asked and the request failed, say the request failed. Only the second of these is a "no results" answer.
+7. Keep job IDs, provider task IDs, location codes, language codes, raw component statuses, and internal field names out of the answer unless the user asks for technical details or troubleshooting.
+8. Use `complete_paid_domain_research` only with an exact non-cached job ID started in this conversation. Use `get_paid_domain_research` for a cache hit or later recall. Neither read tool makes a paid call.
 
 ## Interpret the evidence
 
