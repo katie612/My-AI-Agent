@@ -2,7 +2,7 @@
 
 ## Start with this table
 
-Run `diagnose.command` on macOS or `diagnose-windows.cmd` on Windows first. It does not call Claude or display credential values.
+Run `diagnose.command` on macOS or `diagnose-windows.cmd` on Windows first. It calls neither Claude nor DataForSEO and does not display credential values.
 
 | What you see | Most likely cause | First action |
 | --- | --- | --- |
@@ -17,6 +17,7 @@ Run `diagnose.command` on macOS or `diagnose-windows.cmd` on Windows first. It d
 | PDF says no readable text was found | The PDF is probably an image-only scan | Create a searchable PDF with trusted OCR software or paste reviewed text |
 | File type is unsupported | The file is not searchable PDF, DOCX, or UTF-8 TXT | Export it to a supported format and retry |
 | Diagnostic says the Anthropic credential is missing | The Claude node still references a nonexistent placeholder | Create `Anthropic account`, select it in the Claude node, save, and publish |
+| Diagnostic says the DataForSEO credential is missing | Workflow `53` still references its safe placeholder | Create the `DataForSEO API` HTTP Basic Auth credential and select it on every DataForSEO node |
 | n8n Overview has no learner checklist | Automatic import was interrupted | Run the platform's `import-workflows` fallback |
 | Claude returns an authentication error | API key is invalid or revoked | Replace only the n8n credential; never put the key in a file |
 | Claude returns a credit/rate error | API billing or workspace limit | Check the Anthropic Console balance and limits |
@@ -115,7 +116,7 @@ The browser intentionally does not show raw workflow errors or credentials.
 4. Run the import fallback again; the fixed workflow IDs prevent duplicate copies.
 5. Ask a technical helper to run `node scripts/local.mjs logs n8n`.
 
-First setup normally imports all eleven workflows automatically. The main agent, health workflow, learner checklist, and temporary setup workflows remain inactive until viewed, run manually, or deliberately published. The import helper publishes the six reviewed runtime dependencies automatically.
+First setup normally imports all seventeen workflows automatically. The main agent, health workflow, learner checklist, and temporary setup workflows remain inactive until viewed, run manually, or deliberately published. The import helper publishes the twelve reviewed runtime dependencies automatically.
 
 ## Claude credential is missing or invalid
 
@@ -133,6 +134,16 @@ An Anthropic web-chat subscription is separate from API access. Follow [N8N_AGEN
 Anthropic API use requires API billing and available usage credit. Open the Anthropic Console to check the workspace's usage, limits, and billing. Add only a small workshop budget and keep the supplied response and iteration limits.
 
 If billing is available, wait briefly and retry. Persistent 429 responses can also mean a workspace rate limit has been reached.
+
+## Paid domain research is unavailable, partial, or empty
+
+1. Open workflow `53 - TOOL - start_paid_domain_research` and confirm all six DataForSEO nodes use the `DataForSEO API` HTTP Basic Auth credential.
+2. Run the diagnostic helper. It checks credential selection without calling DataForSEO or showing credential values.
+3. Confirm the current chat directly requests the domain. Standard paid research defaults to Australia and English; there is no ownership, permission, market-code, language-code, or second cost-confirmation question.
+4. Inspect the saved component statuses. `failed`, `no_results`, `unavailable`, and `skipped` mean different things and should not be reworded as findings.
+5. Do not automatically retry a failed paid request. The agent should use the free website-only fallback when no useful paid evidence was returned. Correct the credential, balance, market, or input before a later paid run.
+
+A failed attempt remains in local history and does not overwrite the last successful company memory. See [PAID_DOMAIN_RESEARCH.md](PAID_DOMAIN_RESEARCH.md).
 
 ## The agent health endpoint does not work
 

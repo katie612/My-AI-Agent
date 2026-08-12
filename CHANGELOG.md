@@ -16,6 +16,19 @@ versioning for local workshop releases.
   protection.
 - Chat database diagnostics, redacted inspection, backup, restore, and reset
   support on macOS and Windows.
+- Domain research as two separate skills: `paid-domain-research`, the default
+  DataForSEO-backed path for a direct request to research a public business
+  domain, and `domain-research`, the free website-only path used on explicit
+  request or when paid evidence is unavailable.
+- Six reviewed n8n tool workflows (`50`-`55`) and matching `tools/policy.json`
+  entries, including the `paid_external_read` risk class.
+- Local business memory, research job, and SEO snapshot tables in the chat
+  database, plus the `/api/business-memory`, `/api/paid-domain-research`, and
+  DNS-safe `/api/public-domain-page` gateway routes.
+- A diagnostics check that confirms a DataForSEO credential is selected without
+  calling the provider or displaying credential values.
+- [PAID_DOMAIN_RESEARCH.md](docs/PAID_DOMAIN_RESEARCH.md) covering private
+  credential setup, bounded spending modes, and honest failure reporting.
 
 ### Changed
 
