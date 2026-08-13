@@ -13,6 +13,8 @@ The starter agent includes:
 | `weekly-status` | How the agent summarises factual task progress |
 | `domain-research` | How the free website-only business research path behaves |
 | `paid-domain-research` | How the default paid-first search and simple SEO advice behave |
+| `my-business` | Your own prices, hours, and terms, so the agent stops guessing them |
+| `seo-article-writer` | How one article idea becomes a grounded Markdown draft for you to review |
 
 ## Change one skill
 
@@ -80,7 +82,9 @@ Rules:
 - `version` uses three numbers such as `1.0.0`.
 - `description` is 240 characters or fewer.
 - `SKILL.md` contains 1-8,000 characters.
-- The combined enabled instructions may contain at most 24,000 characters.
+- The combined enabled instructions may contain at most 200,000 characters. This
+  is a runaway guard, not a budget to plan around: enabling every skill in this
+  project stays well under it, so adding a skill never means removing another.
 
 The helper rejects an invalid skill before changing the running agent. It stores a content hash alongside the compiled bundle so technical contributors can see exactly which version is active.
 

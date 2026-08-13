@@ -17,6 +17,7 @@ In about 30 minutes you will have:
 - PDF, DOCX, TXT, and long-transcript input.
 - Local project tasks and conversation memory.
 - Editable Markdown skills.
+- Background SEO article drafts grounded in saved research and verified public sources.
 - Confirmation-gated task creation and status changes.
 
 Everything runs locally as ordinary Node.js processes. Nothing is deployed to the cloud in this release.
@@ -210,11 +211,11 @@ Reset asks you to type `RESET`. The [operations and recovery guide](docs/LOCAL_O
 - A checksum-verified Node.js 24.18.0 and npm 11.16.0 bootstrap for macOS and Windows, stored only inside `.runtime/` when the computer needs it.
 - The exact pinned n8n release, installed with npm and kept in this project's folder.
 - A TypeScript chat gateway, custom browser interface, and isolated document reader.
-- Seventeen reviewed n8n workflows, including the visual learner checklist.
+- Twenty reviewed n8n workflows, including the visual learner checklist and the background SEO article writer.
 - Durable local SQLite chat history with browsing, full-text search, rename,
   deletion, and restart-safe bounded conversation memory.
 - Four local Data Tables for tasks, audits, pending confirmations, and enabled skills.
-- Four editable Markdown skills, including grounded meeting analysis.
+- Editable Markdown skills, including grounded meeting analysis, paid DataForSEO domain research, its free fallback, saved business facts, and SEO article drafting.
 - A central agent registry with Project Manager active and Sales, Marketing,
   Investment, and Bookkeeping shown as coming soon.
 - Local extraction for searchable PDFs, DOCX, TXT, and pasted text.
@@ -236,6 +237,7 @@ multi-user authentication, RAG, queues, and autonomous background work.
 - [GitHub Desktop workflow](docs/GITHUB_DESKTOP.md)
 - [Connect the visual agent to Claude](docs/N8N_AGENT_SETUP.md)
 - [Customise the chat](docs/CUSTOMISE_CHAT.md)
+- [Create grounded SEO article drafts](docs/SEO_ARTICLE_WRITER.md)
 - [Customise Markdown skills](docs/CUSTOMISE_SKILLS.md)
 - [Use documents and long transcripts](docs/DOCUMENT_UPLOADS.md)
 - [Understand durable local chat memory](docs/CHAT_PERSISTENCE_PLAN.md)

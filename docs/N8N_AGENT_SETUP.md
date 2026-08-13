@@ -30,7 +30,7 @@ Anthropic API access is billed separately from a Claude web-chat subscription. T
 
 ## 1. Confirm the automatic workflow import
 
-The repository includes seventeen reviewed workflow exports. First setup imports them automatically, so learners do not need to build nodes from a blank canvas.
+The repository includes twenty reviewed workflow exports. First setup imports them automatically, so learners do not need to build nodes from a blank canvas.
 
 Refresh the n8n Overview. If `01 - START HERE - Learner Checklist` appears, continue to step 2.
 
@@ -46,9 +46,9 @@ If macOS blocks it, Control-click the file, choose **Open**, then confirm.
 
 Double-click `import-workflows-windows.cmd`.
 
-The fallback opens a terminal, checks the workflows and Markdown skills, starts n8n if needed, and imports all seventeen workflows. It briefly enables localhost-only setup endpoints to create local tables and sync enabled skills, then immediately removes both endpoints. It publishes the reviewed runtime subworkflows but does not publish the main agent, health workflow, or an API key.
+The fallback opens a terminal, checks the workflows and Markdown skills, starts n8n if needed, and imports all twenty workflows. It briefly enables localhost-only setup endpoints to create local tables and sync enabled skills, then immediately removes both endpoints. It publishes the reviewed runtime subworkflows but does not publish the main agent, health workflow, or an API key.
 
-Refresh the n8n Overview. All seventeen workflows should appear:
+Refresh the n8n Overview. All twenty workflows should appear:
 
 - `00 - START HERE - Project Partner`
 - `01 - START HERE - Learner Checklist`
@@ -66,6 +66,9 @@ Refresh the n8n Overview. All seventeen workflows should appear:
 - `53 - TOOL - start_paid_domain_research`
 - `54 - TOOL - complete_paid_domain_research`
 - `55 - TOOL - get_paid_domain_research`
+- `56 - TOOL - start_seo_article`
+- `57 - INTERNAL - write_seo_article`
+- `58 - TOOL - get_seo_article`
 - `90 - DEBUG - Agent Health`
 
 The twelve runtime dependencies—task read tool, two proposal tools, confirmation dispatcher, two task write workers, three free domain-research tools, and three paid domain-research tools—are published automatically. The task write workers are callable only by workflow `40`; no AI Tool node points to them. The main agent, health workflow, and two temporary setup workflows remain inactive drafts. The learner checklist is an inactive visual guide that can be opened or run manually.
@@ -117,6 +120,10 @@ Research finishes inside `start_domain_research`, which reads one public page, a
 
 Paid SEO research is the default path for a direct domain request and needs one more credential. Create an **HTTP Basic Auth** credential named `DataForSEO API`, put the provider's API login and API password in it, and select it on all six DataForSEO nodes in workflow `53`. Never put those values in a file or chat. The exact setup, cost, and failure rules are in [PAID_DOMAIN_RESEARCH.md](PAID_DOMAIN_RESEARCH.md).
 
+The SEO article writer uses the same `Anthropic account` credential and needs no second key. Open `57 - INTERNAL - write_seo_article` and check that both **Draft With Claude** and **Repair With Claude** show `Anthropic account`. Import matches credentials by name, so usually they are already selected. If either is empty, select it and save. Workflows `56` and `58` hold no credential at all: they read and write only the local chat gateway at `http://127.0.0.1:3000`.
+
+The article writer makes no DataForSEO call of its own. It reuses research you have already paid for, so drafting an article never spends provider credit.
+
 ## 4. Inspect and publish the agent
 
 Open `00 - START HERE - Project Partner`. The sticky notes describe the read, proposal, and confirmation paths.
@@ -140,6 +147,8 @@ Open `00 - START HERE - Project Partner`. The sticky notes describe the read, pr
 | **start_paid_domain_research** | Default domain-research path: standard DataForSEO evidence for Australia and English, with no ownership follow-up |
 | **complete_paid_domain_research** | Reads one exact paid attempt from this conversation without another provider call |
 | **get_paid_domain_research** | Reads saved rankings, SEO competitors, keywords, SERPs, costs, sources, and warnings |
+| **start_seo_article** | Queues a grounded review draft from saved domain research; makes no new paid SEO call |
+| **get_seo_article** | Checks a conversation-bound article job and returns its local Markdown download when ready |
 | **Confirm Stored Action** | Calls the deterministic confirmation workflow before either write worker |
 | **Return Agent Reply** | Returns only `sessionId`, `reply`, and `runId` |
 | **Return Invalid Request** | Returns a safe 400 or 413 response without calling Claude |

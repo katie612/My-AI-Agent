@@ -19,6 +19,9 @@ Run `diagnose.command` on macOS or `diagnose-windows.cmd` on Windows first. It c
 | Diagnostic says the Anthropic credential is missing | The Claude node still references a nonexistent placeholder | Create `Anthropic account`, select it in the Claude node, save, and publish |
 | Diagnostic says the DataForSEO credential is missing | Workflow `53` still references its safe placeholder | Create the `DataForSEO API` HTTP Basic Auth credential and select it on every DataForSEO node |
 | n8n Overview has no learner checklist | Automatic import was interrupted | Run the platform's `import-workflows` fallback |
+| The article never becomes ready | The background writer is not published, or n8n was restarted mid-run | Publish `57 - INTERNAL - write_seo_article`, then ask for the article again |
+| Article draft is refused for thin evidence | Fewer than four verifiable public sources were found | Run domain research again, or pick a different article idea |
+| Article says unsupported claims remained after one repair | Every quote must match the source page character for character, and pages with bullet lists, curly apostrophes, or bracketed asides often fail that check | Ask for the article again using source pages written in plain paragraphs, and say that quotes must be copied exactly from one paragraph |
 | Claude returns an authentication error | API key is invalid or revoked | Replace only the n8n credential; never put the key in a file |
 | Claude returns a credit/rate error | API billing or workspace limit | Check the Anthropic Console balance and limits |
 | Plain `yes` does not create a task | Expected safety behaviour | Send the exact, current `CONFIRM XXXXXXXX` phrase |

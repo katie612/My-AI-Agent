@@ -56,6 +56,10 @@ const runtimeRoot = resolve(
 const npmInstallTimeoutMs = 30 * 60 * 1_000;
 const npmCommandTimeoutMs = 10 * 60 * 1_000;
 const n8nCliTimeoutMs = 5 * 60 * 1_000;
+// Kept in step with SCHEMA_VERSION in apps/chat/src/chat-store.ts. diagnose and
+// restore compare against it, so a bump there without a bump here reports a
+// healthy database as broken.
+const chatDatabaseSchemaVersion = 5;
 
 const paths = {
   envFile: join(projectRoot, ".env"),
@@ -118,6 +122,9 @@ const workflowIds = {
     "phase11StartPaidDomainResearch",
     "phase11CompletePaidDomainResearch",
     "phase11GetPaidDomainResearch",
+    "phase13StartSeoArticle",
+    "phase13WriteSeoArticle",
+    "phase13GetSeoArticle",
   ],
 };
 
@@ -141,6 +148,9 @@ const exportedWorkflowFiles = [
     "54-tool-complete-paid-domain-research.json",
   ],
   ["phase11GetPaidDomainResearch", "55-tool-get-paid-domain-research.json"],
+  ["phase13StartSeoArticle", "56-tool-start-seo-article.json"],
+  ["phase13WriteSeoArticle", "57-internal-write-seo-article.json"],
+  ["phase13GetSeoArticle", "58-tool-get-seo-article.json"],
   ["phase3AgentHealth", "90-debug-agent-health.json"],
 ];
 
@@ -1833,7 +1843,7 @@ async function commandRestore(args) {
       return 1;
     }
     const chatCheck = sqliteQuickCheck(chatBackupDatabase);
-    if (!chatCheck.ok || chatCheck.schemaVersion !== 1) {
+    if (!chatCheck.ok || chatCheck.schemaVersion !== chatDatabaseSchemaVersion) {
       printError("The backed-up chat database failed its integrity or schema check. No local data was changed.");
       return 1;
     }
@@ -2007,8 +2017,13 @@ async function commandDiagnose() {
   }
   if (existsSync(paths.chatDatabase)) {
     const chatDatabaseCheck = sqliteQuickCheck(paths.chatDatabase);
-    if (chatDatabaseCheck.ok && chatDatabaseCheck.schemaVersion === 1) {
-      ok("The local chat database and search index are ready (schema 1).");
+    if (
+      chatDatabaseCheck.ok &&
+      chatDatabaseCheck.schemaVersion === chatDatabaseSchemaVersion
+    ) {
+      ok(
+        `The local chat database and search index are ready (schema ${chatDatabaseSchemaVersion}).`,
+      );
     } else {
       failure(
         "The local chat database failed its integrity or schema check. Create a private backup before troubleshooting it.",

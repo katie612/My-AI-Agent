@@ -6,3 +6,5 @@ weekly-status
 linkedin-profile-lookup
 paid-domain-research
 domain-research
+my-business
+seo-article-writer

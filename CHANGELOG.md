@@ -7,6 +7,16 @@ versioning for local workshop releases.
 
 ### Added
 
+- `seo-article-writer`: an on-demand, review-first path from saved business facts
+  and domain research to a grounded Markdown article draft. Workflow `56`
+  registers the job and queues the writer, `57` drafts and repairs it in the
+  background against at least four verified public sources, and `58` reports
+  status and the local download. It publishes nothing, schedules nothing, buys
+  no backlinks, and makes no new DataForSEO call.
+- `my-business`: the saved prices, hours, and terms the article writer reads so
+  it stops guessing them.
+- Article briefs on paid domain research: a completed or reused paid snapshot now
+  returns up to three simple article choices alongside the SEO evidence.
 - Durable plaintext SQLite chat history stored in the Git-ignored local data
   folder.
 - Conversation browsing, full-text search, rename, delete, pagination, and
