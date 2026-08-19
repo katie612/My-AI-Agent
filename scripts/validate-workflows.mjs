@@ -1,11 +1,23 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { compileSkills } from "./compile-skills.mjs";
+import { readFolderManifest } from "./apply-workflow-folders.mjs";
+import { AGENT_IDS, compileSkills } from "./compile-skills.mjs";
+import {
+  AGENT_NODE_NAMES,
+  validateAgentRouting,
+  validateAgentToolScopes,
+} from "./agent-runtime-contract.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const workflowDirectory = join(projectRoot, "n8n", "workflows");
-const expectedFiles = [
+
+// The base agent ships with these and nothing else. Every other workflow,
+// tool, policy entry, and instruction line arrives with an optional skill, so
+// the expected shape below is derived from whichever skills are installed
+// rather than hardcoded. That is what lets a learner add a skill without the
+// release check turning red.
+const baseFiles = [
   "00-start-here-project-partner.json",
   "01-start-here-learner-checklist.json",
   "10-setup-local-task-data.json",
@@ -16,21 +28,118 @@ const expectedFiles = [
   "30-tool-propose-create-task.json",
   "31-tool-propose-update-task-status.json",
   "40-confirm-task-write.json",
-  "50-tool-start-domain-research.json",
-  "51-tool-complete-domain-research.json",
-  "52-tool-get-business-memory.json",
-  "53-tool-start-paid-domain-research.json",
-  "54-tool-complete-paid-domain-research.json",
-  "55-tool-get-paid-domain-research.json",
-  "56-tool-start-seo-article.json",
-  "57-internal-write-seo-article.json",
-  "58-tool-get-seo-article.json",
   "90-debug-agent-health.json",
 ];
+const baseSkillIds = [
+  "project-assistant",
+  "meeting-analysis",
+  "task-capture",
+  "weekly-status",
+];
+const baseToolNames = ["list_tasks", "create_task", "update_task_status"];
+const basePolicyTuples = [
+  ["list_tasks", "read", "automatic"],
+  ["create_task", "write", "confirmation_required"],
+  ["update_task_status", "write", "confirmation_required"],
+];
+// Non-sticky nodes in the base agent workflow. Each installed tool adds one.
+const baseAgentNodeCount = 21;
+
+async function readOptionalSkills() {
+  const optionalRoot = join(projectRoot, "optional-skills");
+  let entries;
+  try {
+    entries = await readdir(optionalRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const skills = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith("_")) {
+      continue;
+    }
+    const manifest = JSON.parse(
+      await readFile(join(optionalRoot, entry.name, "manifest.json"), "utf8"),
+    );
+    // A skill counts as installed once its instructions are in skills/.
+    let installed = true;
+    try {
+      await readFile(join(projectRoot, "skills", entry.name, "skill.yaml"), "utf8");
+    } catch {
+      installed = false;
+    }
+    let workflowFiles = [];
+    try {
+      workflowFiles = (await readdir(join(optionalRoot, entry.name, "workflows")))
+        .filter((file) => file.endsWith(".json"));
+    } catch {}
+    skills.push({ ...manifest, workflowFiles, installed });
+  }
+  return skills;
+}
+
+const optionalSkills = await readOptionalSkills();
+const installedSkills = optionalSkills.filter((skill) => skill.installed);
+
+// Deep per-tool checks below are written for tools that may or may not be
+// present. A tool that is not part of the base and is not wired into the agent
+// belongs to a skill this copy does not have, which is not a failure.
+//
+// This deliberately reads the agent workflow rather than the optional-skills
+// catalogue, because `make-base` ships an agent with no catalogue at all and
+// that copy still has to validate.
+const wiredToolNames = new Set(
+  JSON.parse(
+    await readFile(
+      join(workflowDirectory, "00-start-here-project-partner.json"),
+      "utf8",
+    ),
+  ).nodes
+    .filter((node) => node.type.endsWith("toolWorkflow"))
+    .map((node) => node.name),
+);
+const isOptionalAndAbsent = (name) =>
+  !baseToolNames.includes(name) && !wiredToolNames.has(name);
+const optionalWorkflowFiles = installedSkills.flatMap((skill) => skill.workflowFiles);
+const optionalToolNames = installedSkills.flatMap((skill) =>
+  (skill.agentTools ?? []).map((tool) => tool.name),
+);
+const optionalPolicyTuples = installedSkills.flatMap((skill) =>
+  (skill.policyEntries ?? [])
+    .filter((entry) => entry.available)
+    .map((entry) => [entry.id, entry.risk, entry.mode]),
+);
+const optionalInstructionText = installedSkills.flatMap((skill) => [
+  ...(skill.policyRules ?? []),
+  ...(skill.policyReplacements ?? []).map((replacement) => replacement.replace),
+]);
+const toolOwnership = new Map(
+  baseToolNames.map((toolName) => [toolName, "project-manager"]),
+);
+for (const skill of installedSkills) {
+  for (const tool of skill.agentTools ?? []) {
+    toolOwnership.set(tool.name, skill.agent);
+  }
+}
+
+const expectedFiles = [...baseFiles, ...optionalWorkflowFiles].sort();
 const failures = [];
 
+// "Agent: start_seo_article must ..." is a check about one named tool. If that
+// tool belongs to a skill the learner never installed, there is nothing to
+// check and nothing to report.
+function isAboutUninstalledTool(message) {
+  const named = /^Agent: ([a-z_]+) /.exec(message);
+  if (named) {
+    return isOptionalAndAbsent(named[1]);
+  }
+  const missingNode = /missing node "([a-z_]+)"$/.exec(message);
+  return Boolean(missingNode) && isOptionalAndAbsent(missingNode[1]);
+}
+
 function check(condition, message) {
-  if (!condition) {
+  if (!condition && !isAboutUninstalledTool(message)) {
     failures.push(message);
   }
 }
@@ -56,6 +165,45 @@ check(
   JSON.stringify(actualFiles) === JSON.stringify(expectedFiles),
   `Expected only ${expectedFiles.join(", ")} in n8n/workflows`,
 );
+
+// A workflow missing from n8n/folders.manifest.json would still import, but it
+// would land outside every skill folder and be invisible to a learner who only
+// ever opens the Personal project.
+const folderManifest = await readFolderManifest();
+const folderIds = new Set();
+const filedWorkflows = new Map();
+for (const folder of folderManifest.folders) {
+  check(
+    Boolean(folder.id) && !folderIds.has(folder.id),
+    `Folder manifest: "${folder.id}" is missing an id or repeats one`,
+  );
+  folderIds.add(folder.id);
+  check(
+    typeof folder.name === "string" &&
+      folder.name.length > 0 &&
+      folder.name.length <= 128,
+    `Folder manifest: "${folder.id}" needs a name of 1 to 128 characters`,
+  );
+  for (const file of folder.workflows) {
+    check(
+      !filedWorkflows.has(file),
+      `Folder manifest: ${file} appears in both ${filedWorkflows.get(file)} and ${folder.id}`,
+    );
+    filedWorkflows.set(file, folder.id);
+  }
+}
+for (const file of expectedFiles) {
+  check(
+    filedWorkflows.has(file),
+    `Folder manifest: ${file} is not in any skill folder`,
+  );
+}
+for (const file of filedWorkflows.keys()) {
+  check(
+    expectedFiles.includes(file),
+    `Folder manifest: ${file} is filed in a folder but is not a workflow export`,
+  );
+}
 
 const workflows = new Map();
 for (const file of expectedFiles) {
@@ -159,7 +307,7 @@ if (agentWorkflow) {
   );
   check(
     agentWorkflow.nodes.filter((node) => node.type !== "n8n-nodes-base.stickyNote")
-      .length <= 24,
+      .length <= baseAgentNodeCount + optionalToolNames.length,
     "Agent workflow must keep confirmation routing and tool wiring explainable",
   );
   check(
@@ -196,7 +344,9 @@ if (agentWorkflow) {
     "Validation: document count and text-size limits are missing",
   );
   check(
-    /agentId !== 'project-manager'/.test(validationCode),
+    /\[\s*'project-manager',\s*'sales',\s*'marketing',\s*'investment',\s*'bookkeeping'\s*\]\.includes\(agentId\)/.test(
+      validationCode,
+    ),
     "Validation: active agent allow-list check is missing",
   );
   check(
@@ -222,33 +372,30 @@ if (agentWorkflow) {
     "Validation false branch must lead to the safe error response",
   );
 
-  const agent = nodeByName(agentWorkflow, "Project Partner Agent");
-  check(
-    agent?.type === "@n8n/n8n-nodes-langchain.agent" &&
-      agent?.typeVersion === 3.1,
-    "Agent: expected AI Agent 3.1",
-  );
-  check(agent?.parameters?.promptType === "define", "Agent: prompt must be explicit");
-  check(
-    agent?.parameters?.text === "={{ $json.message }}",
-    "Agent: must use only the normalised message",
-  );
-  check(
-    agent?.parameters?.options?.systemMessage === "={{ $json.systemMessage }}",
-    "Agent: system instructions must come from the validated context builder",
-  );
-  check(
-    agent?.parameters?.options?.maxIterations === 4,
-    "Agent: maxIterations must remain 4",
-  );
-  check(
-    agent?.parameters?.options?.enableStreaming === false,
-    "Agent: streaming must remain disabled for the synchronous contract",
-  );
-  check(
-    agent?.parameters?.options?.returnIntermediateSteps === false,
-    "Agent: intermediate steps must not be returned",
-  );
+  for (const agentName of AGENT_NODE_NAMES) {
+    const agent = nodeByName(agentWorkflow, agentName);
+    check(
+      agent?.type === "@n8n/n8n-nodes-langchain.agent" &&
+        agent?.typeVersion === 3.1,
+      `Agent: ${agentName} must use AI Agent 3.1`,
+    );
+    check(
+      agent?.parameters?.promptType === "define" &&
+        agent?.parameters?.text === "={{ $json.message }}" &&
+        agent?.parameters?.options?.systemMessage ===
+          "={{ $json.systemMessage }}",
+      `Agent: ${agentName} must use only validated message and system context`,
+    );
+    check(
+      agent?.parameters?.options?.maxIterations === 4 &&
+        agent?.parameters?.options?.enableStreaming === false &&
+        agent?.parameters?.options?.returnIntermediateSteps === false,
+      `Agent: ${agentName} must retain the reviewed cost and response limits`,
+    );
+  }
+  for (const failure of validateAgentRouting(agentWorkflow)) {
+    check(false, `Agent routing: ${failure}`);
+  }
 
   const model = nodeByName(agentWorkflow, "Claude - Sonnet 4.6");
   check(
@@ -264,10 +411,15 @@ if (agentWorkflow) {
     model?.parameters?.options?.maxTokensToSample === 2200,
     "Claude model: output token ceiling must remain 2,200",
   );
+  const modelTargets = connectionTargets(
+    agentWorkflow,
+    "Claude - Sonnet 4.6",
+    "ai_languageModel",
+    0,
+  ).sort();
   check(
-    connectionTargets(agentWorkflow, "Claude - Sonnet 4.6", "ai_languageModel", 0)
-      .includes("Project Partner Agent"),
-    "Claude model must be connected to the agent",
+    JSON.stringify(modelTargets) === JSON.stringify([...AGENT_NODE_NAMES].sort()),
+    "Claude model must be connected to all five and only the five reviewed agents",
   );
 
   const memory = agentWorkflow.nodes.find(
@@ -299,30 +451,35 @@ if (agentWorkflow) {
   );
   check(
     connectionTargets(agentWorkflow, "list_tasks", "ai_tool", 0).includes(
-      "Project Partner Agent",
+      "Project Manager Agent",
     ),
     "Agent: list_tasks must be connected as an AI tool",
   );
   const connectedToolNames = Object.entries(agentWorkflow.connections)
     .filter(([, connection]) => Array.isArray(connection.ai_tool))
     .map(([name]) => name);
-  check(
-    JSON.stringify(connectedToolNames) ===
-      JSON.stringify([
-        "list_tasks",
-        "create_task",
-        "update_task_status",
-        "start_domain_research",
-        "complete_domain_research",
-        "get_business_memory",
-        "start_paid_domain_research",
-        "complete_paid_domain_research",
-        "get_paid_domain_research",
-        "start_seo_article",
-        "get_seo_article",
-      ]),
-    "Agent: only the reviewed task, domain-research, and article tools may be connected",
+  // Order follows whichever sequence the learner installed skills in, so this
+  // compares membership rather than position.
+  const allowedToolNames = [...baseToolNames, ...optionalToolNames].sort();
+  const unexpectedTools = connectedToolNames.filter(
+    (name) => !allowedToolNames.includes(name),
   );
+  const missingBaseTools = baseToolNames.filter(
+    (name) => !connectedToolNames.includes(name),
+  );
+  check(
+    unexpectedTools.length === 0 && missingBaseTools.length === 0,
+    "Agent: only the base task tools and tools from installed skills may be connected" +
+      (unexpectedTools.length > 0 ? ` (unexpected: ${unexpectedTools.join(", ")})` : "") +
+      (missingBaseTools.length > 0 ? ` (missing: ${missingBaseTools.join(", ")})` : ""),
+  );
+  check(
+    optionalToolNames.every((name) => connectedToolNames.includes(name)),
+    "Agent: every tool from an installed skill must be wired to its agent",
+  );
+  for (const failure of validateAgentToolScopes(agentWorkflow, toolOwnership)) {
+    check(false, `Agent tool scope: ${failure}`);
+  }
 
   const createTool = nodeByName(agentWorkflow, "create_task");
   check(
@@ -388,7 +545,7 @@ if (agentWorkflow) {
       /free start_domain_research fallback/i.test(
         startPaidResearchTool?.parameters?.description ?? "",
       ),
-    "Agent: domain research must default to paid standard research with a free fallback",
+    "Agent: start_paid_domain_research must default to paid standard research with a free fallback",
   );
   const completePaidResearchTool = nodeByName(
     agentWorkflow,
@@ -414,22 +571,39 @@ if (agentWorkflow) {
       ),
     "Agent: get_paid_domain_research must read only reviewed local snapshots",
   );
+  const linkedInLookupTool = nodeByName(
+    agentWorkflow,
+    "lookup_linkedin_profile",
+  );
+  check(
+    linkedInLookupTool?.parameters?.workflowId?.value ===
+      "phase12LookupLinkedInProfile" &&
+      /explicitly approves one Crustdata search costing up to 0\.30 credits/i.test(
+        linkedInLookupTool?.parameters?.description ?? "",
+      ) &&
+      /Pass full_name exactly/.test(
+        linkedInLookupTool?.parameters?.description ?? "",
+      ) &&
+      /Do not normalize or shorten it/.test(
+        linkedInLookupTool?.parameters?.workflowInputs?.value?.full_name ?? "",
+      ) &&
+      /never returns phone numbers, email addresses, contact data/i.test(
+        linkedInLookupTool?.parameters?.description ?? "",
+      ),
+    "Agent: lookup_linkedin_profile must require per-search credit approval and exclude contact data",
+  );
   const startSeoArticleTool = nodeByName(agentWorkflow, "start_seo_article");
   check(
     startSeoArticleTool?.parameters?.workflowId?.value === "phase13StartSeoArticle" &&
       /background/i.test(startSeoArticleTool?.parameters?.description ?? "") &&
-      /no new DataForSEO purchase/i.test(
-        startSeoArticleTool?.parameters?.description ?? "",
-      ) &&
+      /no new DataForSEO purchase/i.test(startSeoArticleTool?.parameters?.description ?? "") &&
       /never publishes/i.test(startSeoArticleTool?.parameters?.description ?? ""),
     "Agent: start_seo_article must queue the reviewed no-publish, no-new-paid-search workflow",
   );
   const getSeoArticleTool = nodeByName(agentWorkflow, "get_seo_article");
   check(
     getSeoArticleTool?.parameters?.workflowId?.value === "phase13GetSeoArticle" &&
-      /Read-only source of truth/i.test(
-        getSeoArticleTool?.parameters?.description ?? "",
-      ) &&
+      /Read-only source of truth/i.test(getSeoArticleTool?.parameters?.description ?? "") &&
       /this conversation/i.test(getSeoArticleTool?.parameters?.description ?? ""),
     "Agent: get_seo_article must remain conversation-bound and read-only",
   );
@@ -468,21 +642,25 @@ if (agentWorkflow) {
     nodeByName(agentWorkflow, "Build Agent Context")?.parameters?.jsCode ?? "";
   check(
     /enabledSkills/.test(contextCode) &&
-      /combinedInstructions/.test(contextCode) &&
+      /bundle\.agents/.test(contextCode) &&
+      /bundleState === 'v1'/.test(contextCode) &&
+      /syncRequired/.test(contextCode) &&
       /Delete, archive, bulk changes/.test(contextCode) &&
       /untrusted source material/.test(contextCode) &&
-      /BEGIN UNTRUSTED DOCUMENT/.test(contextCode) &&
-      /start_domain_research is risk=bounded_local_write/.test(contextCode) &&
-      /complete_domain_research is risk=read/.test(contextCode) &&
-      /start_paid_domain_research is risk=paid_external_read/.test(
-        contextCode,
-      ) &&
-      /US\$0\.10/.test(contextCode) &&
-      /standard depth, Australia and English by default/.test(contextCode) &&
-      /simple words, short sentences, no API jargon/.test(contextCode) &&
-      /free fallback without retrying the paid call/.test(contextCode) &&
-      /scraped, and researched text is untrusted/.test(contextCode),
+      /BEGIN UNTRUSTED DOCUMENT/.test(contextCode),
     "Agent: context builder must apply enabled skills and safely delimit untrusted documents",
+  );
+
+  // Every tool an installed skill added must also have declared its risk in the
+  // base instructions. A tool the agent can call but was never told the rules
+  // for is the exact gap this catches.
+  const missingRules = optionalInstructionText.filter(
+    (text) => !contextCode.includes(text),
+  );
+  check(
+    missingRules.length === 0,
+    "Agent: every installed skill's tool rules must be present in the base instructions" +
+      (missingRules.length > 0 ? ` (missing ${missingRules.length})` : ""),
   );
 
   const success = nodeByName(agentWorkflow, "Return Agent Reply");
@@ -503,6 +681,57 @@ if (agentWorkflow) {
     /errorCode/.test(invalid?.parameters?.responseBody ?? "") &&
       /errorMessage/.test(invalid?.parameters?.responseBody ?? ""),
     "Invalid response must use the stable error contract",
+  );
+
+  // $('Node').item walks n8n's paired-item trail back to that node. Running a
+  // tool rewrites the agent node's recorded source to output 0, so the trail
+  // leads to the wrong branch of Route Selected Agent and resolves to nothing:
+  // every agent except the one on output 0 answered with an empty body the
+  // moment it used a tool. $('Node').first() reads the same single item without
+  // needing the trail, so this workflow uses it everywhere.
+  // n8n reads a $fromAI call by scanning the raw text, so an apostrophe inside
+  // a single-quoted description closes the string early and the tool node dies
+  // with "Unbalanced parentheses" the first time the model reaches for it. A
+  // description carrying an apostrophe has to be written in backticks.
+  //
+  // Which makes a backtick inside a backtick exactly as fatal, and far more
+  // tempting: backticks are how anyone writes an example value, and the
+  // description they are writing is already backtick-quoted because it
+  // contains an apostrophe. This check read only the single-quoted ones and
+  // waved five broken descriptions through. It now reads whichever quote the
+  // description actually opened with.
+  const brokenFromAi = [
+    ...new Set(
+      agentWorkflow.nodes.flatMap((node) =>
+        JSON.stringify(node.parameters ?? {})
+          .split("$fromAI(")
+          .slice(1)
+          .map((tail) => tail.slice(0, tail.indexOf(") }}") + 1))
+          .filter((call) => {
+            const description = call.slice(call.indexOf(",") + 1).trim();
+            const quote = description.charAt(0);
+            if (quote !== "'" && quote !== "`") return false;
+            const body = description.slice(1);
+            return !body.slice(body.indexOf(quote) + 1).trim().startsWith(",");
+          })
+          .map(() => node.name),
+      ),
+    ),
+  ];
+  check(
+    brokenFromAi.length === 0,
+    "Tool descriptions must not close their own quote: write one containing an " +
+      "apostrophe in backticks, and never put a backtick inside it" +
+      (brokenFromAi.length > 0 ? ` (${brokenFromAi.join(", ")})` : ""),
+  );
+
+  const pairedItemNodes = agentWorkflow.nodes
+    .filter((node) => /\$\('[^']+'\)\.item\b/.test(JSON.stringify(node.parameters ?? {})))
+    .map((node) => node.name);
+  check(
+    pairedItemNodes.length === 0,
+    "Agent workflow must read earlier nodes with .first(), not .item" +
+      (pairedItemNodes.length > 0 ? ` (${pairedItemNodes.join(", ")})` : ""),
   );
 }
 
@@ -614,9 +843,11 @@ if (skillSyncWorkflow) {
     nodeByName(skillSyncWorkflow, "Validate Skill Bundle")?.parameters?.jsCode ??
     "";
   check(
-    /schemaVersion/.test(bundleValidation) &&
+    /body\.schemaVersion !== 2/.test(bundleValidation) &&
       /enabledSkills/.test(bundleValidation) &&
-      /combinedInstructions\.length > 200000/.test(bundleValidation) &&
+      /globalInstructions\.length > 200000/.test(bundleValidation) &&
+      /A skill is assigned to the wrong agent group/.test(bundleValidation) &&
+      /agent\.context\.length <= 200000/.test(bundleValidation) &&
       /\[a-f0-9\]\{64\}/.test(bundleValidation),
     "Skill sync: bundle metadata, size, and source hash must be validated",
   );
@@ -638,6 +869,81 @@ if (skillSyncWorkflow) {
           condition.keyValue === "enabledSkills",
       ),
     "Skill sync: enabled skill bundle must replace one stable config row",
+  );
+}
+
+const linkedInLookupWorkflow = workflows.get(
+  "61-tool-lookup-linkedin-profile.json",
+);
+if (linkedInLookupWorkflow) {
+  const trigger = nodeByName(linkedInLookupWorkflow, "Tool Input");
+  const inputNames =
+    trigger?.parameters?.workflowInputs?.values?.map((input) => input.name) ?? [];
+  check(
+    JSON.stringify(inputNames) ===
+      JSON.stringify([
+        "session_id",
+        "request_id",
+        "email_address",
+        "full_name",
+        "country_region",
+        "state_province",
+        "city_location",
+        "industry",
+        "paid_lookup_confirmed",
+      ]),
+    "LinkedIn lookup: visible tool input schema changed unexpectedly",
+  );
+  const validationCode =
+    nodeByName(linkedInLookupWorkflow, "Validate Lookup Input")?.parameters
+      ?.jsCode ?? "";
+  check(
+    /paidLookupConfirmed = \$json\.paid_lookup_confirmed === true/.test(
+      validationCode,
+    ) &&
+      /PAID_LOOKUP_APPROVAL_REQUIRED/.test(validationCode) &&
+      /maxCredits: 0\.30/.test(validationCode) &&
+      /basic_profile\.name', type: '\(\.\)'/.test(validationCode) &&
+      /australianCapitalRegions/.test(validationCode) &&
+      /inferredRegion/.test(validationCode) &&
+      !/industryFields|industryConditions/.test(validationCode),
+    "LinkedIn lookup: approval, credit ceiling, or broad discovery rules are missing",
+  );
+  const provider = nodeByName(
+    linkedInLookupWorkflow,
+    "Search Crustdata People",
+  );
+  check(
+    provider?.parameters?.method === "POST" &&
+      provider?.parameters?.url === "https://api.crustdata.com/person/search" &&
+      provider?.parameters?.genericAuthType === "httpBearerAuth" &&
+      provider?.parameters?.headerParameters?.parameters?.some(
+        (header) =>
+          header.name === "x-api-version" && header.value === "2025-11-01",
+      ),
+    "LinkedIn lookup: Crustdata person search must use pinned Bearer authentication",
+  );
+  const rankingCode =
+    nodeByName(linkedInLookupWorkflow, "Rank Safe Candidates")?.parameters
+      ?.jsCode ?? "";
+  check(
+    /profile_enriched: false/.test(rankingCode) &&
+      /slice\(0, 3\)/.test(rankingCode) &&
+      /linkedinSlug/.test(rankingCode) &&
+      /structuredLocation/.test(rankingCode) &&
+      /professionalText/.test(rankingCode) &&
+      /professionalNetworkName/.test(rankingCode) &&
+      /requested professional title/.test(rankingCode) &&
+      /industry or professional context/.test(rankingCode) &&
+      !/business_emails|personal_emails|phone_numbers|contact\./i.test(
+        rankingCode,
+      ),
+    "LinkedIn lookup: result shaping must remain bounded and contact-data free",
+  );
+  check(
+    linkedInLookupWorkflow.meta?.toolRisk === "paid_external_read" &&
+      linkedInLookupWorkflow.meta?.maximumCreditsPerRun === 0.3,
+    "LinkedIn lookup: paid-read risk metadata or credit ceiling is missing",
   );
 }
 
@@ -1108,13 +1414,25 @@ if (startPaidResearchWorkflow) {
     "https://api.dataforseo.com/v3/dataforseo_labs/google/related_keywords/live",
     "https://api.dataforseo.com/v3/serp/google/organic/live/regular",
   ];
-  const paidHttpNodes = startPaidResearchWorkflow.nodes.filter(
-    (node) => dataForSeoUrls.includes(String(node.parameters?.url ?? "")),
+  // Each seed gets its own call, because a live endpoint rejects every task after
+  // the first, so a reviewed endpoint may now appear several times. What must not
+  // change is the set: every DataForSEO URL in here is one of the six, and all six
+  // are still present.
+  const paidHttpNodes = startPaidResearchWorkflow.nodes.filter((node) =>
+    String(node.parameters?.url ?? "").includes("api.dataforseo.com"),
   );
+  const paidCalledUrls = startPaidResearchWorkflow.nodes
+    .map((node) => String(node.parameters?.url ?? ""))
+    .filter((url) => url.includes("api.dataforseo.com"));
+  const unreviewed = [...new Set(paidCalledUrls)].filter(
+    (url) => !dataForSeoUrls.includes(url),
+  );
+  const missing = dataForSeoUrls.filter((url) => !paidCalledUrls.includes(url));
   check(
-    JSON.stringify(paidHttpNodes.map((node) => node.parameters.url)) ===
-      JSON.stringify(dataForSeoUrls),
-    "start_paid_domain_research may use only the six reviewed DataForSEO endpoints",
+    unreviewed.length === 0 && missing.length === 0,
+    "start_paid_domain_research may use only the six reviewed DataForSEO endpoints" +
+      (unreviewed.length > 0 ? ` (unreviewed: ${unreviewed.join(", ")})` : "") +
+      (missing.length > 0 ? ` (missing: ${missing.join(", ")})` : ""),
   );
   check(
     paidHttpNodes.every(
@@ -1237,6 +1555,95 @@ for (const file of [
   );
 }
 
+const startSeoArticleWorkflow = workflows.get("56-tool-start-seo-article.json");
+if (startSeoArticleWorkflow) {
+  const requests = startSeoArticleWorkflow.nodes.filter(
+    (node) => node.type === "n8n-nodes-base.httpRequest",
+  );
+  const queue = nodeByName(startSeoArticleWorkflow, "Queue Background Writer");
+  check(
+    startSeoArticleWorkflow.id === "phase13StartSeoArticle" &&
+      startSeoArticleWorkflow.meta?.toolRisk === "bounded_local_write" &&
+      startSeoArticleWorkflow.meta?.paidCalls === "none" &&
+      requests.every((node) =>
+        /^=?http:\/\/127\.0\.0\.1:3000\//.test(String(node.parameters?.url ?? "")),
+      ),
+    "start_seo_article must use only reviewed local storage and research reads",
+  );
+  check(
+    queue?.parameters?.workflowId?.value === "phase13WriteSeoArticle" &&
+      queue?.parameters?.options?.waitForSubWorkflow === false &&
+      startSeoArticleWorkflow.settings?.executionTimeout <= 30,
+    "start_seo_article must queue the background writer without waiting",
+  );
+  const registrationBody =
+    nodeByName(startSeoArticleWorkflow, "Register Article Job")?.parameters?.jsonBody ?? "";
+  const registrationCheck =
+    nodeByName(startSeoArticleWorkflow, "Check Job Registration")?.parameters?.jsCode ?? "";
+  check(
+    /selectionNumber/.test(registrationBody) &&
+      /chooseStrongestKeyword/.test(registrationBody) &&
+      /targetAudience/.test(registrationBody) &&
+      /offer/.test(registrationBody) &&
+      /price/.test(registrationBody) &&
+      /boundaries/.test(registrationBody) &&
+      /voice/.test(registrationBody) &&
+      /needs_selection/.test(registrationCheck) &&
+      /needs_details/.test(registrationCheck),
+    "start_seo_article must use the saved brief and ask only for missing essentials",
+  );
+}
+
+const writeSeoArticleWorkflow = workflows.get("57-internal-write-seo-article.json");
+if (writeSeoArticleWorkflow) {
+  const requests = writeSeoArticleWorkflow.nodes.filter(
+    (node) => node.type === "n8n-nodes-base.httpRequest",
+  );
+  const destinations = requests.map((node) => String(node.parameters?.url ?? ""));
+  check(
+    writeSeoArticleWorkflow.id === "phase13WriteSeoArticle" &&
+      writeSeoArticleWorkflow.meta?.modelCallable === false &&
+      writeSeoArticleWorkflow.meta?.paidCalls === "none" &&
+      writeSeoArticleWorkflow.settings?.executionTimeout === 1800 &&
+      destinations.every(
+        (url) =>
+          /^=?http:\/\/127\.0\.0\.1:3000\//.test(url) ||
+          url === "https://api.anthropic.com/v1/messages",
+      ),
+    "write_seo_article must remain an internal bounded compiler with reviewed destinations",
+  );
+  check(
+    destinations.filter((url) => url === "https://api.anthropic.com/v1/messages").length === 2 &&
+      /pages\.length<4/.test(
+        nodeByName(writeSeoArticleWorkflow, "Prepare Grounded Draft")?.parameters?.jsCode ?? "",
+      ) &&
+      /UNTRUSTED DATA/.test(
+        nodeByName(writeSeoArticleWorkflow, "Prepare Grounded Draft")?.parameters?.jsCode ?? "",
+      ) &&
+      /unsupported/.test(
+        nodeByName(writeSeoArticleWorkflow, "Inspect Repaired Draft")?.parameters?.jsCode ?? "",
+      ),
+    "write_seo_article must require four sources, resist prompt injection, and allow one repair only",
+  );
+}
+
+const getSeoArticleWorkflow = workflows.get("58-tool-get-seo-article.json");
+if (getSeoArticleWorkflow) {
+  const requests = getSeoArticleWorkflow.nodes.filter(
+    (node) => node.type === "n8n-nodes-base.httpRequest",
+  );
+  check(
+    getSeoArticleWorkflow.id === "phase13GetSeoArticle" &&
+      getSeoArticleWorkflow.meta?.toolRisk === "read" &&
+      getSeoArticleWorkflow.meta?.paidCalls === "none" &&
+      requests.length === 1 &&
+      /127\.0\.0\.1:3000\/api\/seo-article\/jobs/.test(
+        String(requests[0]?.parameters?.url ?? ""),
+      ) &&
+      Object.keys(requests[0]?.credentials ?? {}).length === 0,
+    "get_seo_article must remain one conversation-bound local read",
+  );
+}
 
 const proposalFiles = [
   "30-tool-propose-create-task.json",
@@ -1434,125 +1841,53 @@ if (confirmWorkflow) {
   );
 }
 
-const startSeoArticleWorkflow = workflows.get("56-tool-start-seo-article.json");
-if (startSeoArticleWorkflow) {
-  const requests = startSeoArticleWorkflow.nodes.filter(
-    (node) => node.type === "n8n-nodes-base.httpRequest",
-  );
-  const queue = nodeByName(startSeoArticleWorkflow, "Queue Background Writer");
-  check(
-    startSeoArticleWorkflow.id === "phase13StartSeoArticle" &&
-      startSeoArticleWorkflow.meta?.toolRisk === "bounded_local_write" &&
-      startSeoArticleWorkflow.meta?.paidCalls === "none" &&
-      requests.every((node) =>
-        /^=?http:\/\/127\.0\.0\.1:3000\//.test(String(node.parameters?.url ?? "")),
-      ),
-    "start_seo_article must use only reviewed local storage and research reads",
-  );
-  check(
-    queue?.parameters?.workflowId?.value === "phase13WriteSeoArticle" &&
-      queue?.parameters?.options?.waitForSubWorkflow === false &&
-      startSeoArticleWorkflow.settings?.executionTimeout <= 30,
-    "start_seo_article must queue the background writer without waiting",
-  );
-  const registrationBody =
-    nodeByName(startSeoArticleWorkflow, "Register Article Job")?.parameters?.jsonBody ?? "";
-  const registrationCheck =
-    nodeByName(startSeoArticleWorkflow, "Check Job Registration")?.parameters?.jsCode ?? "";
-  check(
-    /selectionNumber/.test(registrationBody) &&
-      /chooseStrongestKeyword/.test(registrationBody) &&
-      /targetAudience/.test(registrationBody) &&
-      /offer/.test(registrationBody) &&
-      /price/.test(registrationBody) &&
-      /boundaries/.test(registrationBody) &&
-      /voice/.test(registrationBody) &&
-      /needs_selection/.test(registrationCheck) &&
-      /needs_details/.test(registrationCheck),
-    "start_seo_article must use the saved brief and ask only for missing essentials",
-  );
-}
-
-const writeSeoArticleWorkflow = workflows.get("57-internal-write-seo-article.json");
-if (writeSeoArticleWorkflow) {
-  const requests = writeSeoArticleWorkflow.nodes.filter(
-    (node) => node.type === "n8n-nodes-base.httpRequest",
-  );
-  const destinations = requests.map((node) => String(node.parameters?.url ?? ""));
-  check(
-    writeSeoArticleWorkflow.id === "phase13WriteSeoArticle" &&
-      writeSeoArticleWorkflow.meta?.modelCallable === false &&
-      writeSeoArticleWorkflow.meta?.paidCalls === "none" &&
-      writeSeoArticleWorkflow.settings?.executionTimeout === 1800 &&
-      destinations.every(
-        (url) =>
-          /^=?http:\/\/127\.0\.0\.1:3000\//.test(url) ||
-          url === "https://api.anthropic.com/v1/messages",
-      ),
-    "write_seo_article must remain an internal bounded compiler with reviewed destinations",
-  );
-  check(
-    destinations.filter((url) => url === "https://api.anthropic.com/v1/messages").length === 2 &&
-      /pages\.length<4/.test(
-        nodeByName(writeSeoArticleWorkflow, "Prepare Grounded Draft")?.parameters?.jsCode ?? "",
-      ) &&
-      /UNTRUSTED DATA/.test(
-        nodeByName(writeSeoArticleWorkflow, "Prepare Grounded Draft")?.parameters?.jsCode ?? "",
-      ) &&
-      /unsupported/.test(
-        nodeByName(writeSeoArticleWorkflow, "Inspect Repaired Draft")?.parameters?.jsCode ?? "",
-      ),
-    "write_seo_article must require four sources, resist prompt injection, and allow one repair only",
-  );
-}
-
-const getSeoArticleWorkflow = workflows.get("58-tool-get-seo-article.json");
-if (getSeoArticleWorkflow) {
-  const requests = getSeoArticleWorkflow.nodes.filter(
-    (node) => node.type === "n8n-nodes-base.httpRequest",
-  );
-  check(
-    getSeoArticleWorkflow.id === "phase13GetSeoArticle" &&
-      getSeoArticleWorkflow.meta?.toolRisk === "read" &&
-      getSeoArticleWorkflow.meta?.paidCalls === "none" &&
-      requests.length === 1 &&
-      /127\.0\.0\.1:3000\/api\/seo-article\/jobs/.test(
-        String(requests[0]?.parameters?.url ?? ""),
-      ) &&
-      Object.keys(requests[0]?.credentials ?? {}).length === 0,
-    "get_seo_article must remain one conversation-bound local read",
-  );
-}
-
-const REVIEWED_SKILL_IDS = [
-  "project-assistant",
-  "meeting-analysis",
-  "task-capture",
-  "weekly-status",
-  "domain-research",
-  "paid-domain-research",
-  "seo-article-writer",
-];
-// Skills that ship alongside the reviewed set. A learner may enable any of
-// them, so the check below guarantees the reviewed set is still present and
-// that nothing unreviewed has been enabled, rather than demanding an exact
-// list.
-const OPTIONAL_SKILL_IDS = ["my-business", "linkedin-profile-lookup"];
+// The base skills always ship enabled. Anything else must be a skill the
+// learner deliberately installed from optional-skills/.
+const installedSkillIds = installedSkills.map((skill) => skill.id);
 
 const skillBundle = await compileSkills(join(projectRoot, "skills"));
 const enabledSkillIds = skillBundle.enabledSkills.map((skill) => skill.id);
+for (const installed of installedSkills) {
+  const compiled = skillBundle.enabledSkills.find(
+    (skill) => skill.id === installed.id,
+  );
+  check(
+    AGENT_IDS.includes(installed.agent) &&
+      compiled?.agent === installed.agent,
+    `Installed skill ${installed.id} must declare the same reviewed agent in manifest.json and skill.yaml`,
+  );
+}
 check(
-  REVIEWED_SKILL_IDS.every((id) => enabledSkillIds.includes(id)),
-  "Enabled skill list must contain the reviewed Project Manager skills",
+  baseSkillIds.every((id) => enabledSkillIds.includes(id)),
+  "Enabled skill list must contain the base Project Manager skills",
+);
+const unreviewedSkills = enabledSkillIds.filter(
+  (id) => !baseSkillIds.includes(id) && !installedSkillIds.includes(id),
 );
 check(
-  enabledSkillIds.every(
-    (id) => REVIEWED_SKILL_IDS.includes(id) || OPTIONAL_SKILL_IDS.includes(id),
-  ),
-  "Enabled skill list must contain only reviewed or shipped optional skills",
+  unreviewedSkills.length === 0,
+  "Enabled skill list must contain only base or installed optional skills" +
+    (unreviewedSkills.length > 0 ? ` (unexpected: ${unreviewedSkills.join(", ")})` : ""),
 );
+const expectedAgentIds = AGENT_IDS;
 check(
-  skillBundle.combinedInstructions.length <= 200_000 &&
+  skillBundle.schemaVersion === 2 &&
+    JSON.stringify(Object.keys(skillBundle.agents)) ===
+      JSON.stringify(expectedAgentIds) &&
+    Object.values(skillBundle.agents).every(
+      (agent) =>
+        agent.instructions.length <= 200_000 &&
+        agent.context.length <= 200_000,
+    ) &&
+    skillBundle.enabledSkills.every((skill) =>
+      skill.agent === "global"
+        ? expectedAgentIds.every((agentId) =>
+            skillBundle.agents[agentId].instructions.includes(
+              `(${skill.id}@${skill.version})`,
+            ),
+          )
+        : skillBundle.agents[skill.agent]?.skillIds.includes(skill.id),
+    ) &&
     /^[a-f0-9]{64}$/.test(skillBundle.sourceHash),
   "Compiled skill bundle must remain bounded and content-addressed",
 );
@@ -1561,38 +1896,39 @@ const toolPolicy = JSON.parse(
   await readFile(join(projectRoot, "tools", "policy.json"), "utf8"),
 );
 const availableToolPolicy = toolPolicy.tools.filter((tool) => tool.available);
+const actualPolicyTuples = availableToolPolicy.map((tool) => [
+  tool.id,
+  tool.risk,
+  tool.mode,
+]);
+const expectedPolicyTuples = [...basePolicyTuples, ...optionalPolicyTuples];
+const asKey = (tuple) => tuple.join("|");
+const expectedPolicyKeys = expectedPolicyTuples.map(asKey);
+const actualPolicyKeys = actualPolicyTuples.map(asKey);
+const unexpectedPolicy = actualPolicyKeys.filter(
+  (key) => !expectedPolicyKeys.includes(key),
+);
+const missingPolicy = expectedPolicyKeys.filter(
+  (key) => !actualPolicyKeys.includes(key),
+);
 check(
   toolPolicy.schemaVersion === 1 &&
-    JSON.stringify(
-      availableToolPolicy.map((tool) => [tool.id, tool.risk, tool.mode]),
-    ) ===
-      JSON.stringify([
-        ["list_tasks", "read", "automatic"],
-        ["create_task", "write", "confirmation_required"],
-        ["update_task_status", "write", "confirmation_required"],
-        [
-          "start_domain_research",
-          "bounded_local_write",
-          "explicit_request_required",
-        ],
-        ["complete_domain_research", "read", "explicit_request_required"],
-        ["get_business_memory", "read", "automatic"],
-        [
-          "start_paid_domain_research",
-          "paid_external_read",
-          "direct_request_defaults_to_standard_paid_with_free_fallback",
-        ],
-        ["complete_paid_domain_research", "read", "explicit_request_required"],
-        ["get_paid_domain_research", "read", "automatic"],
-        ["start_seo_article", "bounded_local_write", "explicit_request_required"],
-        [
-          "write_seo_article",
-          "bounded_external_read_and_local_write",
-          "internal_background_only",
-        ],
-        ["get_seo_article", "read", "automatic"],
-      ]),
-  "Tool policy must classify the reviewed task, research, and article tools",
+    unexpectedPolicy.length === 0 &&
+    missingPolicy.length === 0,
+  "Tool policy must classify exactly the base tools plus those of installed skills" +
+    (unexpectedPolicy.length > 0 ? ` (unexpected: ${unexpectedPolicy.join(", ")})` : "") +
+    (missingPolicy.length > 0 ? ` (missing: ${missingPolicy.join(", ")})` : ""),
+);
+
+// A tool the model can call but that no policy entry classifies is the gap
+// that let two skills ship without a declared risk level.
+const unclassifiedTools = [...baseToolNames, ...optionalToolNames].filter(
+  (name) => !toolPolicy.tools.some((tool) => tool.id === name),
+);
+check(
+  unclassifiedTools.length === 0,
+  "Every wired tool must have a policy entry" +
+    (unclassifiedTools.length > 0 ? ` (missing: ${unclassifiedTools.join(", ")})` : ""),
 );
 check(
   toolPolicy.tools

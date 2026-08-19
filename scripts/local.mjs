@@ -34,6 +34,7 @@ import net from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import { writeSkillSyncState } from "./skill-sync-state.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const isWindows = process.platform === "win32";
@@ -56,9 +57,6 @@ const runtimeRoot = resolve(
 const npmInstallTimeoutMs = 30 * 60 * 1_000;
 const npmCommandTimeoutMs = 10 * 60 * 1_000;
 const n8nCliTimeoutMs = 5 * 60 * 1_000;
-// Kept in step with SCHEMA_VERSION in apps/chat/src/chat-store.ts. diagnose and
-// restore compare against it, so a bump there without a bump here reports a
-// healthy database as broken.
 const chatDatabaseSchemaVersion = 5;
 
 const paths = {
@@ -76,6 +74,7 @@ const paths = {
   agentRegistry: join(projectRoot, "apps", "chat", "config", "agents.json"),
   chatDataDir: join(projectRoot, "data", "chat"),
   chatDatabase: join(projectRoot, "data", "chat", "chat.sqlite"),
+  profileDataDir: join(projectRoot, "data", "profile"),
   documentWorkerDir: join(projectRoot, "services", "document-worker"),
   documentWorkerServer: join(
     projectRoot,
@@ -94,7 +93,6 @@ const paths = {
   ),
   documentDataDir: join(projectRoot, "data", "documents"),
   workflowsDir: join(projectRoot, "n8n", "workflows"),
-  workflowImportDir: join(runtimeRoot, "workflow-import"),
   backupsDir: join(projectRoot, "backups"),
   runtimeDir: runtimeRoot,
   npmCacheDir: join(runtimeRoot, "npm-cache"),
@@ -103,56 +101,48 @@ const paths = {
   operationLock: join(projectRoot, "data", "run", "operation.lock"),
 };
 
+// Workflows installed from the optional catalogue appear as files in this
+// directory. Derive the publish and export inventories from those files so a
+// newly installed skill cannot be silently omitted by a hand-maintained list.
+const MUST_BE_LIVE = /^\d+-(tool|setup|internal|confirm|run)-/;
+
+function reviewedWorkflowFiles() {
+  return readdirSync(paths.workflowsDir)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+    .map((name) => {
+      const workflow = JSON.parse(
+        readFileSync(join(paths.workflowsDir, name), "utf8"),
+      );
+      if (typeof workflow.id !== "string" || workflow.id.length === 0) {
+        throw new Error(`${name} has no stable workflow ID.`);
+      }
+      return { name, workflow };
+    });
+}
+
+const reviewedWorkflows = reviewedWorkflowFiles();
 const workflowIds = {
   main: "phase3StartHere",
   health: "phase3AgentHealth",
   checklist: "phase6LearnerChecklist",
   taskSetup: "phase4TaskSetup",
   skillSync: "phase5SyncEnabledSkills",
-  tools: [
-    "phase4ListTasks",
-    "phase4CreateTask",
-    "phase4UpdateTaskStatus",
-    "phase5ProposeCreateTask",
-    "phase5ProposeTaskStatus",
-    "phase5ConfirmTaskWrite",
-    "phase9StartDomainResearch",
-    "phase9CompleteDomainResearch",
-    "phase9GetBusinessMemory",
-    "phase11StartPaidDomainResearch",
-    "phase11CompletePaidDomainResearch",
-    "phase11GetPaidDomainResearch",
-    "phase13StartSeoArticle",
-    "phase13WriteSeoArticle",
-    "phase13GetSeoArticle",
-  ],
+  tools: reviewedWorkflows
+    .filter(({ name }) => MUST_BE_LIVE.test(name))
+    .map(({ workflow }) => workflow.id)
+    .filter(
+      (id) =>
+        id !== "phase3StartHere" &&
+        id !== "phase4TaskSetup" &&
+        id !== "phase5SyncEnabledSkills",
+    ),
 };
 
-const exportedWorkflowFiles = [
-  ["phase3StartHere", "00-start-here-project-partner.json"],
-  ["phase6LearnerChecklist", "01-start-here-learner-checklist.json"],
-  ["phase4TaskSetup", "10-setup-local-task-data.json"],
-  ["phase5SyncEnabledSkills", "11-setup-sync-enabled-skills.json"],
-  ["phase4ListTasks", "20-tool-list-tasks.json"],
-  ["phase4CreateTask", "21-tool-create-task.json"],
-  ["phase4UpdateTaskStatus", "22-tool-update-task-status.json"],
-  ["phase5ProposeCreateTask", "30-tool-propose-create-task.json"],
-  ["phase5ProposeTaskStatus", "31-tool-propose-update-task-status.json"],
-  ["phase5ConfirmTaskWrite", "40-confirm-task-write.json"],
-  ["phase9StartDomainResearch", "50-tool-start-domain-research.json"],
-  ["phase9CompleteDomainResearch", "51-tool-complete-domain-research.json"],
-  ["phase9GetBusinessMemory", "52-tool-get-business-memory.json"],
-  ["phase11StartPaidDomainResearch", "53-tool-start-paid-domain-research.json"],
-  [
-    "phase11CompletePaidDomainResearch",
-    "54-tool-complete-paid-domain-research.json",
-  ],
-  ["phase11GetPaidDomainResearch", "55-tool-get-paid-domain-research.json"],
-  ["phase13StartSeoArticle", "56-tool-start-seo-article.json"],
-  ["phase13WriteSeoArticle", "57-internal-write-seo-article.json"],
-  ["phase13GetSeoArticle", "58-tool-get-seo-article.json"],
-  ["phase3AgentHealth", "90-debug-agent-health.json"],
-];
+const exportedWorkflowFiles = reviewedWorkflows.map(({ name, workflow }) => [
+  workflow.id,
+  name,
+]);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -265,6 +255,8 @@ function chatEnv(cfg) {
     CHAT_REQUEST_TIMEOUT_MS: "120000",
     CHAT_DATA_DIRECTORY: paths.chatDataDir,
     DOCUMENT_DATA_DIRECTORY: paths.documentDataDir,
+    PROFILE_DATA_DIRECTORY: paths.profileDataDir,
+    SKILLS_DIRECTORY: join(projectRoot, "skills"),
     DOCUMENT_WORKER_URL: `http://127.0.0.1:${cfg.documentWorkerPort}`,
     N8N_CHAT_WEBHOOK_URL: `http://127.0.0.1:${cfg.n8nPort}/webhook/chat`,
   };
@@ -1143,41 +1135,61 @@ async function compileSkillBundle() {
   const { compileSkills } = await import(
     new URL("./compile-skills.mjs", import.meta.url)
   );
-  return JSON.stringify(await compileSkills());
+  return compileSkills(join(projectRoot, "skills"), {
+    profileDirectory: paths.profileDataDir,
+  });
 }
 
-// The committed workflow files address the chat gateway on its documented
-// default port. A learner who set CHAT_PORT in .env would otherwise import
-// tool workflows that call a port nothing is listening on, so the files are
-// staged with the configured port instead of being edited in place.
-const DEFAULT_GATEWAY_ORIGIN = "http://127.0.0.1:3000";
+// n8n's Overview page is always a flat list of every workflow, so the skill
+// folders only show up inside the local owner's Personal project. Grouping the
+// workflows is what makes that page worth opening; skillsUrl is how a learner
+// finds it.
+// Returns false when grouping was skipped for a good reason, most often an n8n
+// with no folder licence. Only a real failure throws.
+function applyWorkflowFolders(extraArgs = []) {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--no-warnings",
+      join(projectRoot, "scripts", "apply-workflow-folders.mjs"),
+      `--database=${join(paths.n8nDataDir, "database.sqlite")}`,
+      ...extraArgs,
+    ],
+    { stdio: "inherit" },
+  );
+  if (result.status === 3) {
+    return false;
+  }
+  if (result.status !== 0) {
+    throw new Error("Grouping the workflows into skill folders failed.");
+  }
+  return true;
+}
 
-function stageWorkflowsForImport(cfg) {
-  if (cfg.chatPort === 3000) {
-    return paths.workflowsDir;
+function personalProjectId() {
+  const databasePath = join(paths.n8nDataDir, "database.sqlite");
+  if (!existsSync(databasePath)) {
+    return null;
   }
-  const target = paths.workflowImportDir;
-  rmSync(target, { recursive: true, force: true });
-  mkdirSync(target, { recursive: true });
-  const origin = `http://127.0.0.1:${cfg.chatPort}`;
-  let rewritten = 0;
-  for (const name of readdirSync(paths.workflowsDir)) {
-    if (!name.endsWith(".json")) {
-      continue;
-    }
-    const source = readFileSync(join(paths.workflowsDir, name), "utf8");
-    const updated = source.split(DEFAULT_GATEWAY_ORIGIN).join(origin);
-    if (updated !== source) {
-      rewritten += 1;
-    }
-    writeFileSync(join(target, name), updated);
-  }
-  if (rewritten > 0) {
-    print(
-      `\nCHAT_PORT is ${cfg.chatPort}, so ${rewritten} workflow file(s) were imported with the chat gateway at ${origin}. The committed files are unchanged.`,
-    );
-  }
-  return target;
+  const script = [
+    "const { DatabaseSync } = require('node:sqlite');",
+    "const database = new DatabaseSync(process.argv[1], { readOnly: true });",
+    "const row = database.prepare(\"SELECT id FROM project WHERE type = 'personal' ORDER BY createdAt ASC LIMIT 1\").get();",
+    "database.close();",
+    "if (row) process.stdout.write(row.id);",
+  ].join(" ");
+  const result = spawnSync(process.execPath, ["-e", script, databasePath], {
+    encoding: "utf8",
+    env: process.env,
+  });
+  const id = result.status === 0 ? result.stdout.trim() : "";
+  return /^[A-Za-z0-9_-]+$/.test(id) ? id : null;
+}
+
+function skillsUrl(cfg) {
+  const projectId = personalProjectId();
+  const base = `http://localhost:${cfg.n8nPort}`;
+  return projectId ? `${base}/projects/${projectId}/workflows` : null;
 }
 
 async function importReviewedWorkflows() {
@@ -1190,14 +1202,14 @@ async function importReviewedWorkflows() {
   }
 
   print("\nImporting the reviewed workflows as inactive drafts...");
-  const importDir = stageWorkflowsForImport(config());
   n8nCliOrThrow(
-    ["import:workflow", "--separate", `--input=${importDir}`],
+    ["import:workflow", "--separate", `--input=${paths.workflowsDir}`],
     "Workflow import",
   );
 
   print("\nPreparing local data, enabled skills, and reviewed tool dependencies...");
   const published = [];
+  let groupedIntoFolders = false;
   try {
     for (const id of [workflowIds.taskSetup, workflowIds.skillSync]) {
       n8nCliOrThrow(["publish:workflow", `--id=${id}`], `Publishing ${id}`);
@@ -1217,12 +1229,19 @@ async function importReviewedWorkflows() {
     }
 
     const bundle = await compileSkillBundle();
-    const skillResponse = await postWebhook("sync-enabled-skills", bundle);
+    const skillResponse = await postWebhook(
+      "sync-enabled-skills",
+      JSON.stringify(bundle),
+    );
     if (!skillResponse.body.includes('"ok":true')) {
       throw new Error(
         `Enabled skill sync returned an unexpected response: ${skillResponse.body}`,
       );
     }
+    await writeSkillSyncState(paths.profileDataDir, bundle.sourceHash);
+
+    print("\nGrouping the workflows into skill folders...");
+    groupedIntoFolders = applyWorkflowFolders();
   } finally {
     for (const id of published) {
       runN8nCli(["unpublish:workflow", `--id=${id}`], { capture: true });
@@ -1233,8 +1252,14 @@ async function importReviewedWorkflows() {
   print("\nWorkflows imported successfully.");
   print("Local task tables and three sample tasks are ready.");
   print("Enabled Markdown skills are synced into the agent.");
+  if (groupedIntoFolders) {
+    print("The workflows are grouped into the reviewed skill folders.");
+  }
   const cfg = config();
-  print(`Open http://localhost:${cfg.n8nPort} and follow docs/N8N_AGENT_SETUP.md.`);
+  const skills = skillsUrl(cfg);
+  print(
+    `Open ${skills ?? `http://localhost:${cfg.n8nPort}`} and follow docs/N8N_AGENT_SETUP.md.`,
+  );
   print(
     "The main agent stays inactive until you select your Anthropic credential and publish it.",
   );
@@ -1527,9 +1552,13 @@ async function commandSetupUnlocked() {
   await waitForService("chat");
 
   const cfg = config();
+  const skills = skillsUrl(cfg);
   print("\nLocal stack is healthy.");
   print(`  Chat app:          http://localhost:${cfg.chatPort}`);
   print(`  n8n editor:        http://localhost:${cfg.n8nPort}`);
+  if (skills) {
+    print(`  Your agent's skills: ${skills}`);
+  }
   print("  Next: create the local n8n owner, then open 01 - START HERE - Learner Checklist.");
   return 0;
 }
@@ -1546,9 +1575,13 @@ async function commandStartUnlocked() {
   await startStack();
 
   const cfg = config();
+  const skills = skillsUrl(cfg);
   print("AI Solopreneur is healthy.");
   print(`  Chat app:          http://localhost:${cfg.chatPort}`);
   print(`  n8n editor:        http://localhost:${cfg.n8nPort}`);
+  if (skills) {
+    print(`  Your agent's skills: ${skills}`);
+  }
   return 0;
 }
 
@@ -1613,6 +1646,22 @@ async function commandImportWorkflows() {
   return 0;
 }
 
+async function commandGroupWorkflows(args = []) {
+  requireLocalInstall();
+  const grouped = applyWorkflowFolders(
+    args.includes("--undo") ? ["--undo"] : [],
+  );
+  const cfg = config();
+  const skills = skillsUrl(cfg);
+  if (grouped && skills) {
+    print(`Open ${skills} to see your agent's skills.`);
+  } else if (skills) {
+    print(`Your workflows are at ${skills}.`);
+  }
+  print("Refresh n8n if it is already open in a browser tab.");
+  return 0;
+}
+
 async function commandSyncSkills() {
   requireLocalInstall();
 
@@ -1634,12 +1683,16 @@ async function commandSyncSkills() {
     publishedSync = true;
     await restartN8n();
 
-    const response = await postWebhook("sync-enabled-skills", bundle);
+    const response = await postWebhook(
+      "sync-enabled-skills",
+      JSON.stringify(bundle),
+    );
     if (!response.body.includes('"ok":true')) {
       throw new Error(
         `Enabled skill sync returned an unexpected response: ${response.body}`,
       );
     }
+    await writeSkillSyncState(paths.profileDataDir, bundle.sourceHash);
   } finally {
     if (publishedSync) {
       runN8nCli(["unpublish:workflow", `--id=${workflowIds.skillSync}`], {
@@ -1717,6 +1770,37 @@ function sqliteQuickCheck(databasePath) {
         ? Number(result.stdout.trim())
         : null,
   };
+}
+
+/**
+ * Packs the agent for the cloud. Run as a child rather than imported so the
+ * passphrase prompt gets the real terminal, and so the packing logic stays out
+ * of this file.
+ */
+async function commandPack() {
+  requireLocalInstall();
+  const packer = join(projectRoot, "scripts", "pack-agent.mjs");
+  const result = spawnSync(process.execPath, [packer], { stdio: "inherit" });
+  if (result.error) {
+    printError(`Could not run the packer: ${result.error.message}`);
+    return 1;
+  }
+  return result.status ?? 1;
+}
+
+/**
+ * Connects the agent to the cloud. A child process for the same reasons as
+ * packing: the Railway sign-in and the passcode prompt both need the real
+ * terminal, not a captured one.
+ */
+async function commandConnectCloud() {
+  const connector = join(projectRoot, "scripts", "connect-cloud.mjs");
+  const result = spawnSync(process.execPath, [connector], { stdio: "inherit" });
+  if (result.error) {
+    printError(`Could not run the cloud connector: ${result.error.message}`);
+    return 1;
+  }
+  return result.status ?? 1;
 }
 
 async function commandBackup() {
@@ -2070,12 +2154,19 @@ async function commandDiagnose() {
           { capture: true },
         );
         if (result.status === 0) {
-          const reference = mainWorkflow.nodes?.find(
-            (node) => node.name === "Claude - Sonnet 4.6",
-          )?.credentials?.anthropicApi;
+          const articleWorkflow = exportedWorkflow("phase13WriteSeoArticle");
+          const references = [
+            mainWorkflow.nodes?.find((node) => node.name === "Claude - Sonnet 4.6")
+              ?.credentials?.anthropicApi,
+            articleWorkflow?.nodes?.find((node) => node.name === "Draft With Claude")
+              ?.credentials?.anthropicApi,
+            articleWorkflow?.nodes?.find((node) => node.name === "Repair With Claude")
+              ?.credentials?.anthropicApi,
+          ].filter(Boolean);
           const credentials = readExportedRows(credentialExport);
-          credentialSelected = Boolean(
-            reference?.id &&
+          credentialSelected = references.length === 3 && references.every(
+            (reference) =>
+              reference?.id &&
               credentials.some(
                 (credential) =>
                   credential.id === reference.id &&
@@ -2089,9 +2180,9 @@ async function commandDiagnose() {
         rmSync(credentialExport, { force: true });
       }
       if (credentialSelected) {
-        ok("An Anthropic credential exists and is selected by the Claude node.");
+        ok("An Anthropic credential is selected by the agent and article writer.");
       } else {
-        action("Create an Anthropic credential named Anthropic account and select it in Claude - Sonnet 4.6.");
+        action("Create an Anthropic credential named Anthropic account and select it in the agent plus both Claude nodes in workflow 57.");
       }
 
       const paidWorkflow = exportedWorkflow("phase11StartPaidDomainResearch");
@@ -2178,9 +2269,19 @@ Everyday commands (also available as double-click files in the project folder):
   status             Show whether each service is running and healthy.
   diagnose           Friendly readiness checks. Never calls Claude.
 
+Putting the agent online:
+  connect-cloud      Set up a cloud project so the agent keeps running with
+                     this computer closed. Signing in and choosing a passcode
+                     stay yours to do.
+  pack               Make one encrypted file holding your keys and settings,
+                     to upload to the agent once it is online.
+
 Maintenance commands:
   import-workflows   Re-import the reviewed workflows, sample data, and skills.
   sync-skills        Validate and load the enabled Markdown skills.
+  group-workflows [--undo]
+                     File the workflows into their skill folders in n8n, or put
+                     them all back at the top level. Needs an n8n folder licence.
   export-workflows   Export normalised workflow copies for Git review.
   backup             Save a private copy of chats, n8n data, and settings.
   restore <folder>   Restore chats and n8n data from a saved backup.
@@ -2219,10 +2320,16 @@ async function main() {
       return commandImportWorkflows();
     case "sync-skills":
       return commandSyncSkills();
+    case "group-workflows":
+      return commandGroupWorkflows(rest);
     case "export-workflows":
       return commandExportWorkflows();
     case "backup":
       return commandBackup();
+    case "pack":
+      return commandPack();
+    case "connect-cloud":
+      return commandConnectCloud();
     case "restore":
       return commandRestore(rest);
     case "reset":
